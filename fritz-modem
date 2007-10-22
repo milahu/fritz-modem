@@ -1,0 +1,186 @@
+#!/bin/sh
+
+# FRITZ!Modem build file
+#
+# Copyright (C) 2007 Axel Gembe <ago@bastart.eu.org>
+#
+# $Id: fritz-modem 1312 2007-10-23 09:35:30Z ago $
+
+if [ "e$1" != "e" ] ; then
+    if [ "$1" == "clean" ] ; then
+        echo " - Cleaning up..."
+        rm -rf build
+        rm -rf dl
+        rm -rf firmware
+        rm -rf root
+        rm -rf output
+        rm -f tools/mksquashfs-lzma
+        rm -f tools/unsquashfs-lzma
+        rm -f tools/find-squashfs
+        rm -f tools/makedevs
+        exit 1
+    fi
+fi
+
+. fritz-modem.conf
+
+FRITZ_MODEM_FW_BASENAME=`basename ${FRITZ_MODEM_FW_URL}`
+
+if ! test -d dl ; then mkdir dl ; fi
+
+if test ! -r dl/${FRITZ_MODEM_FW_BASENAME} || test `md5sum dl/${FRITZ_MODEM_FW_BASENAME} | awk '{print $1}'` != ${FRITZ_MODEM_FW_MD5SUM} ; then
+    # We don't have the firmware yet or the MD5 sum doesn't match, redownload it
+
+    if ! wget -O dl/${FRITZ_MODEM_FW_BASENAME} ${FRITZ_MODEM_FW_URL} ; then
+        # Hrmmm, wget failed
+        echo " - Failed to download the firmware!"
+        exit 1
+    fi
+
+    if test `md5sum dl/${FRITZ_MODEM_FW_BASENAME} | awk '{print $1}'` != ${FRITZ_MODEM_FW_MD5SUM} ; then
+        # Hrmmm, the checksum didn't match
+        echo " - Downloaded firmware doesn't match the checksum!"
+        exit 1
+    fi
+else
+    echo " - Firmware file ${FRITZ_MODEM_FW_BASENAME} is already downloaded."
+fi
+
+if test ! -r firmware/firmware_${FRITZ_MODEM_FW_MD5SUM}.image ; then
+    # Unpack the firmware into a temporary directory
+    if ! test -d temp ; then mkdir temp ; fi
+    unzip -o -d temp dl/${FRITZ_MODEM_FW_BASENAME}
+    rm -f temp/*.exe temp/*.txt
+
+    # Move the firmware into the firmware directory with the checksum appended to the name
+    if ! test -d firmware ; then mkdir firmware ; fi
+    mv `find temp -type f | head -n1` firmware/firmware_${FRITZ_MODEM_FW_MD5SUM}.image
+
+    # Remove temporary directory
+    rm -rf temp
+else
+    echo " - Firmware is already extracted."
+fi
+
+if test ! -x tools/mksquashfs-lzma ; then
+    if ! test -d build ; then mkdir -p build ; fi
+    
+    unzip tools/src/lzma406.zip -d build/lzma406
+    tar -C build -xzvf tools/src/squashfs2.2.tar.gz
+    
+    pushd build
+        pushd lzma406
+            sed -e 's/\x0D//' -i SRC/7zip/Compress/LZMA/LZMADecoder.*
+            cat ../../tools/src/lzma-zlib-stream.patch | patch -p0
+            make -C SRC/7zip/Compress/LZMA_Lib
+            cp SRC/7zip/Compress/LZMA_Lib/liblzma.a .
+        popd
+        pushd squashfs2.2
+            cat ../../tools/src/squashfs-lzma.patch | patch -p0
+            pushd squashfs-tools
+                make mksquashfs-lzma unsquashfs-lzma
+                mv mksquashfs-lzma ../../../tools/
+                mv unsquashfs-lzma ../../../tools/
+            popd
+        popd
+        
+        rm -rf lzma406
+        rm -rf squashfs2.2
+    popd
+else
+    echo " - SquashFS LZMA tools already built."
+fi
+
+if test ! -x tools/find-squashfs ; then
+    if ! test -d build ; then mkdir -p build ; fi
+    
+    tar -C build -xjvf tools/src/find-squashfs.tar.bz2
+
+    pushd build
+        pushd find-squashfs
+            make
+            mv find-squashfs ../../tools/
+        popd
+        
+        rm -rf find-squashfs
+    popd
+else
+    echo " - SquashFS splitter already built."
+fi
+
+if test ! -x tools/makedevs ; then
+    if ! test -d build ; then mkdir -p build ; fi
+    
+    tar -C build -xjvf tools/src/makedevs.tar.bz2
+
+    pushd build
+        pushd makedevs
+            make
+            mv makedevs ../../tools/
+        popd
+        
+        rm -rf makedevs
+    popd
+else
+    echo " - Makedevs already built."
+fi
+
+if test ! -r firmware/firmware_${FRITZ_MODEM_FW_MD5SUM}_kernel.raw ; then
+    ./tools/find-squashfs firmware/firmware_${FRITZ_MODEM_FW_MD5SUM}.image
+    mv kernel.raw firmware/firmware_${FRITZ_MODEM_FW_MD5SUM}_kernel.raw
+    mv kernelsquashfs.raw firmware/firmware_${FRITZ_MODEM_FW_MD5SUM}_squashfs.raw
+else
+    echo " - Firmware is already split."
+fi
+
+if test ! -d firmware/root_${FRITZ_MODEM_FW_MD5SUM} ; then
+    fakeroot ./tools/unsquashfs-lzma -dest firmware/root_${FRITZ_MODEM_FW_MD5SUM} firmware/firmware_${FRITZ_MODEM_FW_MD5SUM}_squashfs.raw
+else
+    echo " - Filesystem is already extracted."
+fi
+
+# Create the firmware root directory
+rm -rf root ; mkdir root ; cp -r -p firmware/root_${FRITZ_MODEM_FW_MD5SUM}/* root
+
+# Prune unused files
+IFS="
+" ; for line in `cat remove.txt` ; do rm -rf $line ; done
+
+# Link the files right
+rm -f root/etc/group ; ln -sf /var/etc/group root/etc/group
+rm -f root/etc/hosts ; ln -sf /var/etc/hosts root/etc/hosts
+rm -f root/etc/passwd ; ln -sf /var/etc/passwd root/etc/passwd
+rm -f root/etc/resolv.conf ; ln -sf /var/etc/resolv.conf root/etc/resolv.conf
+rm -f root/etc/shadow ; ln -sf /var/etc/shadow root/etc/shadow
+ln -sf /var/etc/conf.d root/etc/conf.d
+
+# Fix permissions
+chmod a-x root/etc/* ; chmod a+X root/etc/* ; chmod u+w root/etc/*
+
+# Apply the overlay files
+cp -r -p files/* root
+
+mkdir root/var/etc/conf.d
+cp -r -p conf/* root/var/etc/conf.d
+
+# Create the var.tar archive
+pushd root
+    tar cpf var.tar var
+    rm -rf var/*
+popd
+
+# Create the new firmware
+CURDIR=`pwd`
+if ! test -d output ; then mkdir output ; fi
+echo "#!/bin/sh" > _fakeroot
+echo    "( cd root && ${CURDIR}/tools/makedevs -d ${CURDIR}/tools/device_table.txt ./ > /dev/null" \
+        "&& ${CURDIR}/tools/mksquashfs-lzma * ${CURDIR}/output/fritz-modem-squashfs.image -le -noappend -all-root " \
+        "-b 65536 -info )" >> _fakeroot
+chmod a+x _fakeroot
+fakeroot -- ./_fakeroot
+rm -f _fakeroot
+cd "${CURDIR}"
+
+dd if=firmware/firmware_${FRITZ_MODEM_FW_MD5SUM}_kernel.raw bs=65536 conv=sync > output/fritz-modem.image
+cat output/fritz-modem-squashfs.image >> output/fritz-modem.image
+rm -f output/fritz-modem-squashfs.image
